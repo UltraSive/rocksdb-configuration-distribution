@@ -17,23 +17,25 @@ import (
 )
 
 type Request struct {
-	Type   string          `json:"type"`
-	Domain string          `json:"domain,omitempty"`
-	Value  json.RawMessage `json:"value,omitempty"`
+	Type  string          `json:"type"`
+	Key   string          `json:"key,omitempty"`
+	Value json.RawMessage `json:"value,omitempty"`
 }
 
 type Response struct {
-	Type   string      `json:"type"`
-	Error  string      `json:"error,omitempty"`
-	Domain string      `json:"domain,omitempty"`
-	Value  interface{} `json:"value,omitempty"`
+	Type  string      `json:"type"`
+	Error string      `json:"error,omitempty"`
+	Key   string      `json:"key,omitempty"`
+	Value interface{} `json:"value,omitempty"`
 }
 
-// simple pubsub: notify all connected clients on change
 var (
 	clientsMu sync.Mutex
 	clients   = make(map[int]net.Conn)
 	nextID    = 0
+
+	readOpts  = grocksdb.NewDefaultReadOptions()
+	writeOpts = grocksdb.NewDefaultWriteOptions()
 )
 
 func notifyAll(msg Response) {
@@ -41,8 +43,7 @@ func notifyAll(msg Response) {
 	frame := encodeFrame(b)
 	clientsMu.Lock()
 	for id, c := range clients {
-		_, err := c.Write(frame)
-		if err != nil {
+		if _, err := c.Write(frame); err != nil {
 			c.Close()
 			delete(clients, id)
 		}
@@ -57,13 +58,11 @@ func encodeFrame(b []byte) []byte {
 }
 
 func handleConn(conn net.Conn, db *grocksdb.DB) {
-	id := 0
-	clientsMu.Lock()
-	id = nextID
+	id := nextID
 	nextID++
+	clientsMu.Lock()
 	clients[id] = conn
 	clientsMu.Unlock()
-
 	defer func() {
 		conn.Close()
 		clientsMu.Lock()
@@ -73,50 +72,34 @@ func handleConn(conn net.Conn, db *grocksdb.DB) {
 
 	rd := bufio.NewReader(conn)
 	for {
-		// read 4-byte length
 		hdr := make([]byte, 4)
 		if _, err := io.ReadFull(rd, hdr); err != nil {
 			return
 		}
-		l := binary.BigEndian.Uint32(hdr)
-		payload := make([]byte, l)
+		payload := make([]byte, binary.BigEndian.Uint32(hdr))
 		if _, err := io.ReadFull(rd, payload); err != nil {
 			return
 		}
 
 		var req Request
 		if err := json.Unmarshal(payload, &req); err != nil {
-			resp := Response{Type: "ERR", Error: err.Error()}
-			conn.Write(encodeFrame(mustJSON(resp)))
+			writeFrame(conn, Response{Type: "ERR", Error: err.Error()})
 			continue
 		}
 
 		switch req.Type {
 		case "GET":
-			ro := grocksdb.NewDefaultReadOptions()
-			v, err := db.Get(ro, []byte(req.Domain))
+			val, err := readKey(db, req.Key)
 			if err != nil {
-				conn.Write(encodeFrame(mustJSON(Response{Type: "ERR", Error: err.Error()})))
+				writeFrame(conn, Response{Type: "ERR", Error: err.Error()})
 				continue
 			}
-			if !v.Exists() {
-				conn.Write(encodeFrame(mustJSON(Response{Type: "OK", Domain: req.Domain, Value: nil})))
-				continue
-			}
-			var val interface{}
-			if err := json.Unmarshal(v.Data(), &val); err != nil {
-				conn.Write(encodeFrame(mustJSON(Response{Type: "ERR", Error: err.Error()})))
-				v.Free()
-				continue
-			}
-			v.Free()
-			conn.Write(encodeFrame(mustJSON(Response{Type: "OK", Domain: req.Domain, Value: val})))
+			writeFrame(conn, Response{Type: "OK", Key: req.Key, Value: val})
 
 		case "LIST":
-			it := db.NewIterator(grocksdb.NewDefaultReadOptions())
-			it.SeekToFirst()
 			all := map[string]interface{}{}
-			for ; it.Valid(); it.Next() {
+			it := db.NewIterator(readOpts)
+			for it.SeekToFirst(); it.Valid(); it.Next() {
 				key := string(it.Key().Data())
 				var val interface{}
 				json.Unmarshal(it.Value().Data(), &val)
@@ -125,27 +108,43 @@ func handleConn(conn net.Conn, db *grocksdb.DB) {
 				it.Value().Free()
 			}
 			it.Close()
-			conn.Write(encodeFrame(mustJSON(Response{Type: "OK", Value: all})))
+			writeFrame(conn, Response{Type: "OK", Value: all})
 
 		case "UPDATE":
-			// req.Domain and req.Value expected
-			wo := grocksdb.NewDefaultWriteOptions()
-			if err := db.Put(wo, []byte(req.Domain), req.Value); err != nil {
-				conn.Write(encodeFrame(mustJSON(Response{Type: "ERR", Error: err.Error()})))
+			if err := db.Put(writeOpts, []byte(req.Key), req.Value); err != nil {
+				writeFrame(conn, Response{Type: "ERR", Error: err.Error()})
 				continue
 			}
-			// notify all clients of update
-			notifyAll(Response{Type: "NOTIFY", Domain: req.Domain, Value: json.RawMessage(req.Value)})
-			conn.Write(encodeFrame(mustJSON(Response{Type: "OK"})))
+			notifyAll(Response{Type: "NOTIFY", Key: req.Key, Value: json.RawMessage(req.Value)})
+			writeFrame(conn, Response{Type: "OK"})
 
 		case "SUBSCRIBE":
-			// just keep connection open; notifications are written by notifyAll
-			conn.Write(encodeFrame(mustJSON(Response{Type: "OK", Value: "subscribed"})))
+			writeFrame(conn, Response{Type: "OK", Value: "subscribed"})
 
 		default:
-			conn.Write(encodeFrame(mustJSON(Response{Type: "ERR", Error: "unknown type"})))
+			writeFrame(conn, Response{Type: "ERR", Error: "unknown type"})
 		}
 	}
+}
+
+func readKey(db *grocksdb.DB, key string) (interface{}, error) {
+	v, err := db.Get(readOpts, []byte(key))
+	if err != nil {
+		return nil, err
+	}
+	defer v.Free()
+	if !v.Exists() {
+		return nil, nil
+	}
+	var val interface{}
+	if err := json.Unmarshal(v.Data(), &val); err != nil {
+		return nil, err
+	}
+	return val, nil
+}
+
+func writeFrame(conn net.Conn, resp Response) {
+	conn.Write(encodeFrame(mustJSON(resp)))
 }
 
 func mustJSON(v interface{}) []byte {
@@ -154,17 +153,15 @@ func mustJSON(v interface{}) []byte {
 }
 
 func main() {
-	// open RocksDB
 	opts := grocksdb.NewDefaultOptions()
 	opts.SetCreateIfMissing(true)
-	db, err := grocksdb.OpenDb(opts, "./confdb")
+	db, err := grocksdb.OpenDb(opts, "./kvdb")
 	if err != nil {
 		panic(err)
 	}
 	defer db.Close()
 
-	// start Unix socket listener (for your custom protocol)
-	socketPath := "/tmp/confsvc.sock"
+	socketPath := "/tmp/kvstore.sock"
 	os.Remove(socketPath)
 	l, err := net.Listen("unix", socketPath)
 	if err != nil {
@@ -173,58 +170,50 @@ func main() {
 	defer l.Close()
 	os.Chmod(socketPath, 0660)
 
-	fmt.Println("config server listening on", socketPath)
+	fmt.Println("KV store server listening on", socketPath)
 
-	// run socket server in a goroutine
 	go func() {
 		for {
-			conn, err := l.Accept()
-			if err != nil {
-				continue
+			if conn, err := l.Accept(); err == nil {
+				go handleConn(conn, db)
 			}
-			go handleConn(conn, db)
 		}
 	}()
 
-	// setup chi API
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
 
-	r.Get("/get/{domain}", func(w http.ResponseWriter, r *http.Request) {
-		domain := chi.URLParam(r, "domain")
-		ro := grocksdb.NewDefaultReadOptions()
-		v, err := db.Get(ro, []byte(domain))
+	r.Get("/{key}", func(w http.ResponseWriter, r *http.Request) {
+		key := chi.URLParam(r, "key")
+		val, err := readKey(db, key)
 		if err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
-		defer v.Free()
-		if !v.Exists() {
+		if val == nil {
 			w.WriteHeader(404)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		w.Write(v.Data())
+		json.NewEncoder(w).Encode(val)
 	})
 
-	r.Post("/update/{domain}", func(w http.ResponseWriter, r *http.Request) {
-		domain := chi.URLParam(r, "domain")
+	r.Post("/{key}", func(w http.ResponseWriter, r *http.Request) {
+		key := chi.URLParam(r, "key")
 		var val interface{}
 		if err := json.NewDecoder(r.Body).Decode(&val); err != nil {
 			http.Error(w, err.Error(), 400)
 			return
 		}
 		data, _ := json.Marshal(val)
-		wo := grocksdb.NewDefaultWriteOptions()
-		if err := db.Put(wo, []byte(domain), data); err != nil {
+		if err := db.Put(writeOpts, []byte(key), data); err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
-		// also notify socket subscribers
-		notifyAll(Response{Type: "NOTIFY", Domain: domain, Value: val})
+		notifyAll(Response{Type: "NOTIFY", Key: key, Value: val})
 		w.WriteHeader(204)
 	})
 
-	fmt.Println("chi API listening on :8080")
+	fmt.Println("HTTP API listening on :8080")
 	http.ListenAndServe(":8080", r)
 }

@@ -1,5 +1,5 @@
 # RocksDB Based Configuration Distribution Server
-Persist state in key value pairs on disk and be able to proxy to full replicas if role indicates.
+This is a configuration distribution server that stores and serves key-value data for clients over HTTP or Unix sockets. It provides fast local access while keeping persistent storage on disk, allowing updates, reads, and listing of stored items. The system is designed to handle multiple clients efficiently and ensures data consistency, making it suitable for distributing configuration or metadata across applications.
 
 ## Quick start (Docker)
 Ensure Docker is installed on your system
@@ -7,13 +7,12 @@ Ensure Docker is installed on your system
 curl -fsSL https://get.docker.com | sh
 ```
 
-### Build The Container
+### Build and Run
 ```bash
+# Build the container
 make docker-build
-```
 
-### Run The Container
-```bash
+# Run the container
 make docker-run
 ```
 

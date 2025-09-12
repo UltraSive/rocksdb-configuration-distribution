@@ -9,7 +9,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"sync"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -30,26 +29,9 @@ type Response struct {
 }
 
 var (
-	clientsMu sync.Mutex
-	clients   = make(map[int]net.Conn)
-	nextID    = 0
-
 	readOpts  = grocksdb.NewDefaultReadOptions()
 	writeOpts = grocksdb.NewDefaultWriteOptions()
 )
-
-func notifyAll(msg Response) {
-	b, _ := json.Marshal(msg)
-	frame := encodeFrame(b)
-	clientsMu.Lock()
-	for id, c := range clients {
-		if _, err := c.Write(frame); err != nil {
-			c.Close()
-			delete(clients, id)
-		}
-	}
-	clientsMu.Unlock()
-}
 
 func encodeFrame(b []byte) []byte {
 	hdr := make([]byte, 4)
@@ -58,17 +40,7 @@ func encodeFrame(b []byte) []byte {
 }
 
 func handleConn(conn net.Conn, db *grocksdb.DB) {
-	id := nextID
-	nextID++
-	clientsMu.Lock()
-	clients[id] = conn
-	clientsMu.Unlock()
-	defer func() {
-		conn.Close()
-		clientsMu.Lock()
-		delete(clients, id)
-		clientsMu.Unlock()
-	}()
+	defer conn.Close()
 
 	rd := bufio.NewReader(conn)
 	for {
@@ -111,15 +83,19 @@ func handleConn(conn net.Conn, db *grocksdb.DB) {
 			writeFrame(conn, Response{Type: "OK", Value: all})
 
 		case "UPDATE":
-			if err := db.Put(writeOpts, []byte(req.Key), req.Value); err != nil {
-				writeFrame(conn, Response{Type: "ERR", Error: err.Error()})
-				continue
+			if len(req.Value) == 0 {
+				// Treat empty value as delete
+				if err := db.Delete(writeOpts, []byte(req.Key)); err != nil {
+					writeFrame(conn, Response{Type: "ERR", Error: err.Error()})
+					continue
+				}
+			} else {
+				if err := db.Put(writeOpts, []byte(req.Key), req.Value); err != nil {
+					writeFrame(conn, Response{Type: "ERR", Error: err.Error()})
+					continue
+				}
 			}
-			notifyAll(Response{Type: "NOTIFY", Key: req.Key, Value: json.RawMessage(req.Value)})
 			writeFrame(conn, Response{Type: "OK"})
-
-		case "SUBSCRIBE":
-			writeFrame(conn, Response{Type: "OK", Value: "subscribed"})
 
 		default:
 			writeFrame(conn, Response{Type: "ERR", Error: "unknown type"})
@@ -200,17 +176,31 @@ func main() {
 
 	r.Post("/{key}", func(w http.ResponseWriter, r *http.Request) {
 		key := chi.URLParam(r, "key")
-		var val interface{}
-		if err := json.NewDecoder(r.Body).Decode(&val); err != nil {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
 			http.Error(w, err.Error(), 400)
 			return
 		}
-		data, _ := json.Marshal(val)
-		if err := db.Put(writeOpts, []byte(key), data); err != nil {
+
+		if len(body) == 0 {
+			// Empty body → delete key
+			if err := db.Delete(writeOpts, []byte(key)); err != nil {
+				http.Error(w, err.Error(), 500)
+				return
+			}
+			w.WriteHeader(204)
+			return
+		}
+
+		var val interface{}
+		if err := json.Unmarshal(body, &val); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		if err := db.Put(writeOpts, []byte(key), body); err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
-		notifyAll(Response{Type: "NOTIFY", Key: key, Value: val})
 		w.WriteHeader(204)
 	})
 

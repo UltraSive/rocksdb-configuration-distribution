@@ -16,16 +16,15 @@ import (
 )
 
 type Request struct {
-	Type  string          `json:"type"`
-	Key   string          `json:"key,omitempty"`
-	Value json.RawMessage `json:"value,omitempty"`
+	Type  string                     `json:"type"`
+	Keys  []string                   `json:"keys,omitempty"`  // for batch get
+	Items map[string]json.RawMessage `json:"items,omitempty"` // for batch update
 }
 
 type Response struct {
-	Type  string      `json:"type"`
-	Error string      `json:"error,omitempty"`
-	Key   string      `json:"key,omitempty"`
-	Value interface{} `json:"value,omitempty"`
+	Type  string                 `json:"type"`
+	Error string                 `json:"error,omitempty"`
+	Data  map[string]interface{} `json:"data,omitempty"` // results for GET
 }
 
 var (
@@ -61,12 +60,16 @@ func handleConn(conn net.Conn, db *grocksdb.DB) {
 
 		switch req.Type {
 		case "GET":
-			val, err := readKey(db, req.Key)
-			if err != nil {
-				writeFrame(conn, Response{Type: "ERR", Error: err.Error()})
-				continue
+			results := make(map[string]interface{})
+			for _, key := range req.Keys {
+				val, err := readKey(db, key)
+				if err != nil {
+					writeFrame(conn, Response{Type: "ERR", Error: err.Error()})
+					continue
+				}
+				results[key] = val
 			}
-			writeFrame(conn, Response{Type: "OK", Key: req.Key, Value: val})
+			writeFrame(conn, Response{Type: "OK", Data: results})
 
 		case "LIST":
 			all := map[string]interface{}{}
@@ -80,20 +83,21 @@ func handleConn(conn net.Conn, db *grocksdb.DB) {
 				it.Value().Free()
 			}
 			it.Close()
-			writeFrame(conn, Response{Type: "OK", Value: all})
+			writeFrame(conn, Response{Type: "OK", Data: all})
 
 		case "UPDATE":
-			if len(req.Value) == 0 {
-				// Treat empty value as delete
-				if err := db.Delete(writeOpts, []byte(req.Key)); err != nil {
-					writeFrame(conn, Response{Type: "ERR", Error: err.Error()})
-					continue
+			wo := writeOpts
+			batch := grocksdb.NewWriteBatch()
+			for key, raw := range req.Items {
+				if len(raw) == 0 {
+					batch.Delete([]byte(key))
+				} else {
+					batch.Put([]byte(key), raw)
 				}
-			} else {
-				if err := db.Put(writeOpts, []byte(req.Key), req.Value); err != nil {
-					writeFrame(conn, Response{Type: "ERR", Error: err.Error()})
-					continue
-				}
+			}
+			if err := db.Write(wo, batch); err != nil {
+				writeFrame(conn, Response{Type: "ERR", Error: err.Error()})
+				continue
 			}
 			writeFrame(conn, Response{Type: "OK"})
 
@@ -156,48 +160,43 @@ func main() {
 		}
 	}()
 
+	// HTTP batch endpoints
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
 
-	r.Get("/{key}", func(w http.ResponseWriter, r *http.Request) {
-		key := chi.URLParam(r, "key")
-		val, err := readKey(db, key)
-		if err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		if val == nil {
-			w.WriteHeader(404)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(val)
-	})
-
-	r.Post("/{key}", func(w http.ResponseWriter, r *http.Request) {
-		key := chi.URLParam(r, "key")
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
+	r.Post("/get", func(w http.ResponseWriter, r *http.Request) {
+		var req Request
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, err.Error(), 400)
 			return
 		}
-
-		if len(body) == 0 {
-			// Empty body → delete key
-			if err := db.Delete(writeOpts, []byte(key)); err != nil {
+		results := make(map[string]interface{})
+		for _, key := range req.Keys {
+			val, err := readKey(db, key)
+			if err != nil {
 				http.Error(w, err.Error(), 500)
 				return
 			}
-			w.WriteHeader(204)
-			return
+			results[key] = val
 		}
+		json.NewEncoder(w).Encode(results)
+	})
 
-		var val interface{}
-		if err := json.Unmarshal(body, &val); err != nil {
+	r.Put("/update", func(w http.ResponseWriter, r *http.Request) {
+		var req Request
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, err.Error(), 400)
 			return
 		}
-		if err := db.Put(writeOpts, []byte(key), body); err != nil {
+		batch := grocksdb.NewWriteBatch()
+		for key, raw := range req.Items {
+			if len(raw) == 0 {
+				batch.Delete([]byte(key))
+			} else {
+				batch.Put([]byte(key), raw)
+			}
+		}
+		if err := db.Write(writeOpts, batch); err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}

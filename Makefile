@@ -3,6 +3,8 @@
 BINARY_NAME := rocksdb-server
 CGO_CFLAGS  := -I/usr/local/include/rocksdb
 CGO_LDFLAGS := -L/usr/local/lib -lrocksdb -lstdc++ -lm -lz -lsnappy -llz4 -lzstd
+DOCKER_IMAGE := rocksdb-config-server
+DOCKER_PORT  := 8080
 
 .PHONY: all build run clean
 
@@ -22,3 +24,11 @@ run: build
 clean:
 	@echo "🧹 Cleaning build artifacts..."
 	rm -f $(BINARY_NAME)
+
+docker-build:
+	@echo "🐳 Building Docker image $(DOCKER_IMAGE)..."
+	docker build -t $(DOCKER_IMAGE) .
+
+docker-run:
+	@echo "🚀 Running Docker container $(DOCKER_IMAGE)..."
+	docker run --rm -p $(DOCKER_PORT):$(DOCKER_PORT) $(DOCKER_IMAGE)

@@ -41,7 +41,7 @@ func encodeFrame(b []byte) []byte {
 // Core request handler shared by socket + HTTP
 func handleRequest(db *grocksdb.DB, req Request) Response {
 	switch req.Type {
-	case "BATCH_GET":
+	case "GET":
 		results := make(map[string]interface{})
 		for _, key := range req.Keys {
 			val, err := readKey(db, key)
@@ -66,7 +66,7 @@ func handleRequest(db *grocksdb.DB, req Request) Response {
 		it.Close()
 		return Response{Type: "OK", Data: all}
 
-	case "BATCH_UPDATE":
+	case "UPDATE":
 		batch := grocksdb.NewWriteBatch()
 		for key, raw := range req.Items {
 			if len(raw) == 0 {

@@ -1,6 +1,21 @@
 # RocksDB Based Configuration Distribution Server
 Persist state in key value pairs on disk and be able to proxy to full replicas if role indicates.
 
+## Quick start (Docker)
+Ensure Docker is installed on your system
+```bash
+curl -fsSL https://get.docker.com | sh
+```
+
+### Build The Container
+```bash
+make docker-build
+```
+
+### Run The Container
+```bash
+make docker-run
+```
 
 ## Quick start (Ubuntu)
 

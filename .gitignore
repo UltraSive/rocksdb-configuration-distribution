@@ -1,6 +1,3 @@
-# Binaries
-rocksdb-server
-
 # RocksDB data directory
 kvdb/
 

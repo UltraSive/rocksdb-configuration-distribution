@@ -1,6 +1,6 @@
 # Makefile for RocksDB Configuration Distribution Server
 
-BINARY_NAME := rocksdb-server
+BINARY_NAME := bin/kvstore
 CGO_CFLAGS  := -I/usr/local/include/rocksdb
 CGO_LDFLAGS := -L/usr/local/lib -lrocksdb -lstdc++ -lm -lz -lsnappy -llz4 -lzstd
 DOCKER_IMAGE := rocksdb-config-server
@@ -15,7 +15,7 @@ build:
 	CGO_ENABLED=1 \
 	CGO_CFLAGS="$(CGO_CFLAGS)" \
 	CGO_LDFLAGS="$(CGO_LDFLAGS)" \
-	go build -o $(BINARY_NAME) .
+	go build -o $(BINARY_NAME) ./cmd/kvstore
 
 run: build
 	@echo "🚀 Running $(BINARY_NAME)..."

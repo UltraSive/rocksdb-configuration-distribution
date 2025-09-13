@@ -52,11 +52,10 @@ func mustJSON(v interface{}) []byte {
 	return b
 }
 
-// readEntry reads a key from rocksdb and returns raw json value if present & valid.
-// If replicaMode == true, treat expiry == MaxInt64 as never-expire and accept legacy raw values.
-// If running in ephemeral mode (upstream set) and stored value is legacy raw (no wrapper),
-// this will wrap it with ttl (or infinite expiry if ttl==0) and write it back for consistent expiry handling.
-func readEntry(db *grocksdb.DB, key string, ttl time.Duration, replicaMode bool) (json.RawMessage, bool, error) {
+// readEntry assumes values are properly formatted dbEntry JSON.
+// Returns value (raw JSON) and true if present and not expired.
+// If expired, deletes it and returns miss.
+func readEntry(db *grocksdb.DB, key string) (json.RawMessage, bool, error) {
 	v, err := db.Get(readOpts, []byte(key))
 	if err != nil {
 		return nil, false, err
@@ -66,51 +65,34 @@ func readEntry(db *grocksdb.DB, key string, ttl time.Duration, replicaMode bool)
 		return nil, false, nil
 	}
 
+	var e dbEntry
+	if err := json.Unmarshal(v.Data(), &e); err != nil {
+		// If store is always well-formed this should not happen; propagate error.
+		return nil, false, fmt.Errorf("malformed entry for key %q: %w", key, err)
+	}
+
 	now := time.Now().UnixNano()
-
-	// Try to unmarshal wrapper first
-	var w dbEntry
-	if err := json.Unmarshal(v.Data(), &w); err == nil {
-		// wrapper parsed
-		if w.Expiry != math.MaxInt64 && now > w.Expiry {
-			// expired -> delete and miss
-			_ = db.Delete(writeOpts, []byte(key))
-			return nil, false, nil
-		}
-		raw := make([]byte, len(w.Value))
-		copy(raw, w.Value)
-		return json.RawMessage(raw), true, nil
+	if e.Expiry != math.MaxInt64 && now > e.Expiry {
+		// expired -> delete and return miss
+		_ = db.Delete(writeOpts, []byte(key))
+		return nil, false, nil
 	}
 
-	// not a wrapper (legacy raw bytes)
-	rawBytes := make([]byte, len(v.Data()))
-	copy(rawBytes, v.Data())
-
-	if replicaMode {
-		// in replica (authoritative) mode, legacy raw is authoritative; return as-is
-		return json.RawMessage(rawBytes), true, nil
-	}
-
-	// ephemeral mode: wrap legacy raw with ttl (or infinite expiry if ttl==0), write back, and return
-	if err := writeEntry(db, key, json.RawMessage(rawBytes), ttl, false); err != nil {
-		// write failure -> still return the raw value (best-effort)
-		return json.RawMessage(rawBytes), true, nil
-	}
-	return json.RawMessage(rawBytes), true, nil
+	// return a copy of bytes
+	raw := make([]byte, len(e.Value))
+	copy(raw, e.Value)
+	return json.RawMessage(raw), true, nil
 }
 
-// writeEntry writes a value into RocksDB. If replicaMode==true OR ttl==0 we store expiry=maxint (never expire),
-// otherwise we set expiry to now+ttl.
-func writeEntry(db *grocksdb.DB, key string, raw json.RawMessage, ttl time.Duration, replicaMode bool) error {
-	w := dbEntry{
-		Value: raw,
-	}
-	if replicaMode || ttl == 0 {
-		w.Expiry = math.MaxInt64
+// writeEntry writes the wrapper into RocksDB. ttl==0 means infinite expiry.
+func writeEntry(db *grocksdb.DB, key string, raw json.RawMessage, ttl time.Duration) error {
+	e := dbEntry{Value: raw}
+	if ttl == 0 {
+		e.Expiry = math.MaxInt64
 	} else {
-		w.Expiry = time.Now().Add(ttl).UnixNano()
+		e.Expiry = time.Now().Add(ttl).UnixNano()
 	}
-	data, err := json.Marshal(&w)
+	data, err := json.Marshal(&e)
 	if err != nil {
 		return err
 	}
@@ -121,43 +103,33 @@ func deleteEntry(db *grocksdb.DB, key string) error {
 	return db.Delete(writeOpts, []byte(key))
 }
 
-// listAllEntries returns a map of keys->values for entries that are currently valid.
-// In replicaMode it returns everything (including legacy raw values).
-func listAllEntries(db *grocksdb.DB, replicaMode bool) (map[string]interface{}, error) {
-	ret := map[string]interface{}{}
+// listAllEntries returns all non-expired entries. If ttl==0 entries never expire.
+func listAllEntries(db *grocksdb.DB) (map[string]interface{}, error) {
+	out := map[string]interface{}{}
 	it := db.NewIterator(readOpts)
 	defer it.Close()
 	now := time.Now().UnixNano()
 
 	for it.SeekToFirst(); it.Valid(); it.Next() {
 		k := string(it.Key().Data())
-		valBytes := it.Value().Data()
-
-		var v interface{}
-		// try wrapper
-		var w dbEntry
-		if err := json.Unmarshal(valBytes, &w); err == nil {
-			// wrapper parsed
-			if replicaMode || w.Expiry == math.MaxInt64 || w.Expiry > now {
-				_ = json.Unmarshal(w.Value, &v)
-				ret[k] = v
+		var e dbEntry
+		if err := json.Unmarshal(it.Value().Data(), &e); err == nil {
+			if e.Expiry == math.MaxInt64 || e.Expiry > now {
+				var v interface{}
+				_ = json.Unmarshal(e.Value, &v)
+				out[k] = v
 			}
 		} else {
-			// legacy raw bytes
-			if replicaMode {
-				_ = json.Unmarshal(valBytes, &v)
-				ret[k] = v
-			}
-			// in ephemeral mode we skip legacy/malformed entries until read (read will wrap them)
+			// With the assumption of well-formed data this branch shouldn't occur.
+			// Skip malformed entries to avoid returning garbage.
 		}
-
 		it.Key().Free()
 		it.Value().Free()
 	}
-	return ret, nil
+	return out, nil
 }
 
-// startCleaner runs only when upstream is set AND ttl>0; it scans and deletes expired entries in chunks
+// startCleaner runs when upstream is set AND ttl>0. It deletes expired entries in batches.
 func startCleaner(db *grocksdb.DB, interval time.Duration, chunkSize int) {
 	t := time.NewTicker(interval)
 	go func() {
@@ -167,9 +139,9 @@ func startCleaner(db *grocksdb.DB, interval time.Duration, chunkSize int) {
 			batch := grocksdb.NewWriteBatch()
 			count := 0
 			for it.SeekToFirst(); it.Valid(); it.Next() {
-				var w dbEntry
-				if err := json.Unmarshal(it.Value().Data(), &w); err == nil {
-					if w.Expiry != math.MaxInt64 && w.Expiry <= now {
+				var e dbEntry
+				if err := json.Unmarshal(it.Value().Data(), &e); err == nil {
+					if e.Expiry != math.MaxInt64 && e.Expiry <= now {
 						batch.Delete(it.Key().Data())
 						count++
 					}
@@ -235,15 +207,13 @@ func fetchFromUpstream(upstream string, key string) (json.RawMessage, bool, erro
 	return raw, true, nil
 }
 
-// handleRequest handles GET/LIST/UPDATE using the DB + mode toggles.
+// handleRequest uses the datastore semantics: on miss, consult upstream only if UPSTREAM_URL set.
 func handleRequest(db *grocksdb.DB, req Request, ttl time.Duration, upstream string) Response {
-	replicaMode := upstream == ""
-
 	switch req.Type {
 	case "GET":
 		results := make(map[string]interface{})
 		for _, key := range req.Keys {
-			raw, ok, err := readEntry(db, key, ttl, replicaMode)
+			raw, ok, err := readEntry(db, key)
 			if err != nil {
 				return Response{Type: "ERR", Error: err.Error()}
 			}
@@ -254,14 +224,15 @@ func handleRequest(db *grocksdb.DB, req Request, ttl time.Duration, upstream str
 				continue
 			}
 
-			// miss: only fetch upstream if upstream is configured (ephemeral mode)
-			if !replicaMode {
+			// miss: only fetch upstream if configured
+			if upstream != "" {
 				rawUp, found, err := fetchFromUpstream(upstream, key)
 				if err != nil {
 					return Response{Type: "ERR", Error: err.Error()}
 				}
 				if found {
-					if err := writeEntry(db, key, rawUp, ttl, false); err != nil {
+					// on write use TTL provided; ttl==0 => infinite
+					if err := writeEntry(db, key, rawUp, ttl); err != nil {
 						return Response{Type: "ERR", Error: err.Error()}
 					}
 					var v interface{}
@@ -271,29 +242,25 @@ func handleRequest(db *grocksdb.DB, req Request, ttl time.Duration, upstream str
 				}
 			}
 
-			// not found
 			results[key] = nil
 		}
 		return Response{Type: "OK", Data: results}
 
 	case "LIST":
-		replicaMode := upstream == ""
-		all, err := listAllEntries(db, replicaMode)
+		all, err := listAllEntries(db)
 		if err != nil {
 			return Response{Type: "ERR", Error: err.Error()}
 		}
 		return Response{Type: "OK", Data: all}
 
 	case "UPDATE":
-		// Update acts as "persist/populate" or delete (if value empty)
-		replicaMode := upstream == ""
 		for key, raw := range req.Items {
 			if len(raw) == 0 {
 				if err := deleteEntry(db, key); err != nil {
 					return Response{Type: "ERR", Error: err.Error()}
 				}
 			} else {
-				if err := writeEntry(db, key, raw, ttl, replicaMode); err != nil {
+				if err := writeEntry(db, key, raw, ttl); err != nil {
 					return Response{Type: "ERR", Error: err.Error()}
 				}
 			}
@@ -310,9 +277,8 @@ func writeFrame(conn net.Conn, resp Response) {
 }
 
 func main() {
-	// Configuration from env
-	upstream := os.Getenv("UPSTREAM_URL") // if set => ephemeral mode, otherwise replica mode
-	ttlStr := os.Getenv("CACHE_TTL")      // if empty => infinite TTL (never expire)
+	upstream := os.Getenv("UPSTREAM_URL") // if set => ephemeral behavior (fetch upstream on miss)
+	ttlStr := os.Getenv("CACHE_TTL")      // if empty or "0" => infinite TTL (never expire)
 	jIntervalStr := os.Getenv("JANITOR_INTERVAL")
 	chunkStr := os.Getenv("JANITOR_CHUNK")
 	dbPath := os.Getenv("DB_PATH")
@@ -321,9 +287,8 @@ func main() {
 	}
 
 	var ttl time.Duration
-	if ttlStr == "" {
-		// empty TTL means "never expire" (infinite)
-		ttl = 0
+	if ttlStr == "" || ttlStr == "0" {
+		ttl = 0 // infinite
 	} else if d, err := time.ParseDuration(ttlStr); err == nil {
 		ttl = d
 	} else {
@@ -348,8 +313,6 @@ func main() {
 		}
 	}
 
-	replicaMode := upstream == ""
-
 	opts := grocksdb.NewDefaultOptions()
 	opts.SetCreateIfMissing(true)
 	db, err := grocksdb.OpenDb(opts, dbPath)
@@ -358,8 +321,8 @@ func main() {
 	}
 	defer db.Close()
 
-	// Start cleaner when ttl > 0 (i.e. a finite TTL was configured).
-	if ttl > 0 {
+	// Only start cleaner if we have an upstream AND TTL is finite (>0).
+	if upstream != "" && ttl > 0 {
 		startCleaner(db, janitorInterval, chunkSize)
 	}
 
@@ -372,13 +335,17 @@ func main() {
 	defer l.Close()
 	os.Chmod(socketPath, 0660)
 
-	if replicaMode {
-		fmt.Printf("RocksDB instance running in replica (authoritative) mode\n")
+	if upstream == "" {
+		if ttl == 0 {
+			fmt.Printf("Datastore running authoritative (no upstream), TTL=infinite (persist forever)\n")
+		} else {
+			fmt.Printf("Datastore running authoritative (no upstream), TTL=%s\n", ttl)
+		}
 	} else {
 		if ttl == 0 {
-			fmt.Printf("RocksDB instance running in ephemeral mode (UPSTREAM=%s, TTL=infinite)\n", upstream)
+			fmt.Printf("Datastore running ephemeral behavior (UPSTREAM=%s), TTL=infinite\n", upstream)
 		} else {
-			fmt.Printf("RocksDB instance running in ephemeral mode (UPSTREAM=%s, TTL=%s)\n", upstream, ttl)
+			fmt.Printf("Datastore running ephemeral behavior (UPSTREAM=%s), TTL=%s\n", upstream, ttl)
 		}
 	}
 	fmt.Printf("DB path: %s\n", dbPath)

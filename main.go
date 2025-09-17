@@ -40,41 +40,63 @@ func mustJSON(v interface{}) []byte {
 	return b
 }
 
-// readEntry uses Badger's native TTL handling
-func readEntry(db *badger.DB, key string) (json.RawMessage, bool, error) {
-	var result json.RawMessage
-	err := db.View(func(txn *badger.Txn) error {
-		item, err := txn.Get([]byte(key))
-		if err == badger.ErrKeyNotFound {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		val, err := item.ValueCopy(nil)
-		if err != nil {
-			return err
-		}
-		result = val
-		return nil
-	})
-	return result, result != nil, err
+// Transaction-aware helpers
+
+func readEntryTxn(txn *badger.Txn, key string) (json.RawMessage, bool, error) {
+	item, err := txn.Get([]byte(key))
+	if err == badger.ErrKeyNotFound {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	val, err := item.ValueCopy(nil)
+	if err != nil {
+		return nil, false, err
+	}
+	return val, true, nil
 }
 
-// writeEntry sets the value with optional TTL
+func writeEntryTxn(txn *badger.Txn, key string, raw json.RawMessage, ttl time.Duration) error {
+	e := badger.NewEntry([]byte(key), raw)
+	if ttl > 0 {
+		e.WithTTL(ttl)
+	}
+	return txn.SetEntry(e)
+}
+
+func deleteEntryTxn(txn *badger.Txn, key string) error {
+	return txn.Delete([]byte(key))
+}
+
+// Single Key Helpers
+
+func readEntry(db *badger.DB, key string) (json.RawMessage, bool, error) {
+	var result json.RawMessage
+	var found bool
+	err := db.View(func(txn *badger.Txn) error {
+		val, ok, err := readEntryTxn(txn, key)
+		if err != nil {
+			return err
+		}
+		if ok {
+			result = val
+			found = true
+		}
+		return nil
+	})
+	return result, found, err
+}
+
 func writeEntry(db *badger.DB, key string, raw json.RawMessage, ttl time.Duration) error {
 	return db.Update(func(txn *badger.Txn) error {
-		e := badger.NewEntry([]byte(key), raw)
-		if ttl > 0 {
-			e.WithTTL(ttl)
-		}
-		return txn.SetEntry(e)
+		return writeEntryTxn(txn, key, raw, ttl)
 	})
 }
 
 func deleteEntry(db *badger.DB, key string) error {
 	return db.Update(func(txn *badger.Txn) error {
-		return txn.Delete([]byte(key))
+		return deleteEntryTxn(txn, key)
 	})
 }
 
@@ -164,36 +186,24 @@ func handleRequest(db *badger.DB, req Request, ttl time.Duration, upstream strin
 	switch req.Type {
 	case "GET":
 		results := make(map[string]interface{})
-		for _, key := range req.Keys {
-			raw, ok, err := readEntry(db, key)
-			if err != nil {
-				return Response{Type: "ERR", Error: err.Error()}
-			}
-			if ok {
-				var v interface{}
-				_ = json.Unmarshal(raw, &v)
-				results[key] = v
-				continue
-			}
-
-			// miss: only fetch upstream if configured
-			if upstream != "" {
-				rawUp, found, err := fetchFromUpstream(upstream, key)
+		err := db.View(func(txn *badger.Txn) error {
+			for _, key := range req.Keys {
+				raw, ok, err := readEntryTxn(txn, key)
 				if err != nil {
-					return Response{Type: "ERR", Error: err.Error()}
+					return err
 				}
-				if found {
-					if err := writeEntry(db, key, rawUp, ttl); err != nil {
-						return Response{Type: "ERR", Error: err.Error()}
-					}
+				if ok {
 					var v interface{}
-					_ = json.Unmarshal(rawUp, &v)
+					_ = json.Unmarshal(raw, &v)
 					results[key] = v
-					continue
+				} else {
+					results[key] = nil
 				}
 			}
-
-			results[key] = nil
+			return nil
+		})
+		if err != nil {
+			return Response{Type: "ERR", Error: err.Error()}
 		}
 		return Response{Type: "OK", Data: results}
 
@@ -205,16 +215,22 @@ func handleRequest(db *badger.DB, req Request, ttl time.Duration, upstream strin
 		return Response{Type: "OK", Data: all}
 
 	case "UPDATE":
-		for key, raw := range req.Items {
-			if len(raw) == 0 {
-				if err := deleteEntry(db, key); err != nil {
-					return Response{Type: "ERR", Error: err.Error()}
-				}
-			} else {
-				if err := writeEntry(db, key, raw, ttl); err != nil {
-					return Response{Type: "ERR", Error: err.Error()}
+		err := db.Update(func(txn *badger.Txn) error {
+			for key, raw := range req.Items {
+				if len(raw) == 0 {
+					if err := deleteEntryTxn(txn, key); err != nil {
+						return err
+					}
+				} else {
+					if err := writeEntryTxn(txn, key, raw, ttl); err != nil {
+						return err
+					}
 				}
 			}
+			return nil
+		})
+		if err != nil {
+			return Response{Type: "ERR", Error: err.Error()}
 		}
 		return Response{Type: "OK"}
 
